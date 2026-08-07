@@ -281,15 +281,35 @@ fn set_owner_only(path: &std::path::Path, mode: u32) {
 fn set_owner_only(_path: &std::path::Path, _mode: u32) {}
 
 /// Build a Command for Ruby tools, auto-detecting bundle exec.
-/// Uses `bundle exec <tool>` when a Gemfile exists (transitive deps like rake
+/// Uses `bundle exec <tool>` inside a Bundler project (transitive deps like rake
 /// won't appear in the Gemfile but still need bundler for version isolation).
 pub fn ruby_exec(tool: &str) -> Command {
-    if std::path::Path::new("Gemfile").exists() {
+    if in_bundler_project() {
         let mut c = Command::new("bundle");
         c.arg("exec").arg(tool);
         return c;
     }
     Command::new(tool)
+}
+
+/// Whether the working directory sits inside a Bundler project.
+///
+/// Bundler honors `BUNDLE_GEMFILE` and otherwise walks up from the working
+/// directory, so testing only the working directory silently drops version
+/// isolation whenever a tool runs from a subdirectory (`cd spec && rspec …`) —
+/// the tool then resolves against whatever is on PATH instead of Gemfile.lock.
+fn in_bundler_project() -> bool {
+    if std::env::var_os("BUNDLE_GEMFILE").is_some() {
+        return true;
+    }
+    std::env::current_dir().is_ok_and(|cwd| bundler_root(&cwd).is_some())
+}
+
+/// Nearest ancestor (starting at `start`) that declares a bundle.
+fn bundler_root(start: &std::path::Path) -> Option<&std::path::Path> {
+    start
+        .ancestors()
+        .find(|dir| dir.join("Gemfile").exists() || dir.join("gems.rb").exists())
 }
 
 /// Count whitespace-delimited tokens in text. Used by filter tests to verify
@@ -497,6 +517,32 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_bundler_root_found_from_subdirectory() {
+        // `cd spec && rspec …` must still resolve through bundler, or the tool
+        // runs against PATH instead of Gemfile.lock.
+        let project = tempfile::tempdir().expect("tempdir");
+        fs::write(project.path().join("Gemfile"), "source 'x'\n").expect("write Gemfile");
+        let nested = project.path().join("spec/acceptance");
+        fs::create_dir_all(&nested).expect("create nested dirs");
+
+        assert!(bundler_root(&nested).is_some());
+        assert!(bundler_root(project.path()).is_some());
+    }
+
+    #[test]
+    fn test_bundler_root_detects_gems_rb() {
+        let project = tempfile::tempdir().expect("tempdir");
+        fs::write(project.path().join("gems.rb"), "source 'x'\n").expect("write gems.rb");
+        assert!(bundler_root(project.path()).is_some());
+    }
+
+    #[test]
+    fn test_bundler_root_absent_outside_project() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert!(bundler_root(empty.path()).is_none());
+    }
 
     #[test]
     fn test_truncate_short_string() {
