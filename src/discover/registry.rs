@@ -5300,6 +5300,29 @@ mod tests {
     }
 
     #[test]
+    fn test_mise_exec_composes_with_env_prefix_and_compound() {
+        // The shapes that actually get typed: an env prefix in front, and the
+        // wrapper sitting in the middle of an && chain behind a `cd`.
+        assert_eq!(
+            super::rewrite_command(
+                "RAILS_ENV=test mise exec -- bundle exec rspec spec/a.rb",
+                &[],
+                &[]
+            ),
+            Some("RAILS_ENV=test mise exec -- rtk rspec spec/a.rb".into())
+        );
+        assert_eq!(
+            super::rewrite_command("cd /tmp && mise exec -- git status", &[], &[]),
+            Some("cd /tmp && mise exec -- rtk git status".into())
+        );
+        // Builtin wrappers must still compose around it.
+        assert_eq!(
+            super::rewrite_command("noglob mise exec -- git status", &[], &[]),
+            Some("noglob mise exec -- rtk git status".into())
+        );
+    }
+
+    #[test]
     fn test_mise_exec_inner_without_equivalent_falls_through() {
         // `htop` has no rtk equivalent, so the mise layer must not claim the
         // command — the registry still matches `mise …` as a whole.

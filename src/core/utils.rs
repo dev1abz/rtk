@@ -284,7 +284,13 @@ fn set_owner_only(_path: &std::path::Path, _mode: u32) {}
 /// Uses `bundle exec <tool>` inside a Bundler project (transitive deps like rake
 /// won't appear in the Gemfile but still need bundler for version isolation).
 pub fn ruby_exec(tool: &str) -> Command {
-    if in_bundler_project() {
+    ruby_exec_bundled(tool, in_bundler_project())
+}
+
+/// `ruby_exec` with the bundler decision supplied, so the command shape can be
+/// asserted without touching the process environment.
+fn ruby_exec_bundled(tool: &str, bundled: bool) -> Command {
+    if bundled {
         let mut c = Command::new("bundle");
         c.arg("exec").arg(tool);
         return c;
@@ -293,16 +299,21 @@ pub fn ruby_exec(tool: &str) -> Command {
 }
 
 /// Whether the working directory sits inside a Bundler project.
+fn in_bundler_project() -> bool {
+    bundler_context(
+        std::env::var_os("BUNDLE_GEMFILE").is_some(),
+        std::env::current_dir().ok().as_deref(),
+    )
+}
+
+/// Bundler's own resolution order, with the inputs injected.
 ///
 /// Bundler honors `BUNDLE_GEMFILE` and otherwise walks up from the working
 /// directory, so testing only the working directory silently drops version
 /// isolation whenever a tool runs from a subdirectory (`cd spec && rspec …`) —
 /// the tool then resolves against whatever is on PATH instead of Gemfile.lock.
-fn in_bundler_project() -> bool {
-    if std::env::var_os("BUNDLE_GEMFILE").is_some() {
-        return true;
-    }
-    std::env::current_dir().is_ok_and(|cwd| bundler_root(&cwd).is_some())
+fn bundler_context(bundle_gemfile_set: bool, cwd: Option<&std::path::Path>) -> bool {
+    bundle_gemfile_set || cwd.is_some_and(|dir| bundler_root(dir).is_some())
 }
 
 /// Nearest ancestor (starting at `start`) that declares a bundle.
@@ -542,6 +553,32 @@ mod tests {
     fn test_bundler_root_absent_outside_project() {
         let empty = tempfile::tempdir().expect("tempdir");
         assert!(bundler_root(empty.path()).is_none());
+    }
+
+    #[test]
+    fn test_bundler_context_honors_bundle_gemfile() {
+        // BUNDLE_GEMFILE points bundler at a Gemfile outside the tree, so it
+        // wins even when no ancestor declares a bundle.
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert!(bundler_context(true, Some(empty.path())));
+        assert!(bundler_context(true, None));
+        assert!(!bundler_context(false, Some(empty.path())));
+        assert!(!bundler_context(false, None));
+    }
+
+    #[test]
+    fn test_ruby_exec_shape() {
+        // Inside a bundle the tool must be spawned through bundler; outside it
+        // must be spawned directly. This is the behaviour that silently broke
+        // when only the working directory was checked for a Gemfile.
+        let bundled = ruby_exec_bundled("rspec", true);
+        assert_eq!(bundled.get_program(), "bundle");
+        let args: Vec<_> = bundled.get_args().collect();
+        assert_eq!(args, ["exec", "rspec"]);
+
+        let bare = ruby_exec_bundled("rspec", false);
+        assert_eq!(bare.get_program(), "rspec");
+        assert_eq!(bare.get_args().count(), 0);
     }
 
     #[test]

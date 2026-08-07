@@ -653,6 +653,60 @@ mod tests {
         assert!(result.contains("expected true but got false"));
     }
 
+    /// End-to-end guard for the empty-message regression.
+    ///
+    /// `with_failures_json()` carries a single-line message, so it passes even
+    /// when only the first line is kept. Real RSpec opens an
+    /// `ExpectationNotMetError` message with a newline, which is the shape that
+    /// actually broke: the summary rendered `ExpectationNotMetError:` and no
+    /// expected/got. This fixture reproduces that and fails on a call-site
+    /// regression, not just a change to the helper.
+    #[test]
+    fn test_filter_rspec_keeps_expected_and_got_from_leading_newline_message() {
+        let json = r#"{
+          "version": "3.13.6",
+          "examples": [
+            {
+              "id": "./spec/probe_spec.rb[1:1]",
+              "description": "matches the expected payload",
+              "full_description": "Probe matches the expected payload",
+              "status": "failed",
+              "file_path": "./spec/probe_spec.rb",
+              "line_number": 6,
+              "run_time": 0.005,
+              "pending_message": null,
+              "exception": {
+                "class": "RSpec::Expectations::ExpectationNotMetError",
+                "message": "\nexpected: {a: 1, b: 3}\n     got: {a: 1, b: 2}\n\n(compared using ==)\n",
+                "backtrace": ["./spec/probe_spec.rb:7:in 'block (2 levels) in <top (required)>'"]
+              }
+            }
+          ],
+          "summary": {
+            "duration": 0.006,
+            "example_count": 1,
+            "failure_count": 1,
+            "pending_count": 0,
+            "errors_outside_of_examples_count": 0
+          },
+          "summary_line": "1 example, 1 failure"
+        }"#;
+
+        let result = filter_rspec_output(json);
+        assert!(
+            result.contains("expected: {a: 1, b: 3}"),
+            "expected value must reach the summary: {result}"
+        );
+        assert!(
+            result.contains("got: {a: 1, b: 2}"),
+            "actual value must reach the summary: {result}"
+        );
+        assert!(
+            !result.contains("ExpectationNotMetError: \n"),
+            "class must never be followed by an empty message: {result}"
+        );
+    }
+
     #[test]
     fn test_filter_rspec_with_pending() {
         let result = filter_rspec_output(with_pending_json());
