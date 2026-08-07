@@ -1170,11 +1170,53 @@ fn rewrite_line_range(cmd: &str) -> Option<String> {
 
 /// Transparent wrappers that RULES can also match as a whole string, so an
 /// unfiltered inner command falls through instead of dropping the rewrite.
+const ROUTABLE_WRAPPER_PREFIXES: &[&str] = &["uv run"];
+
+/// Split `mise exec [tool@version ...] -- <cmd>` into wrapper prefix and inner
+/// command. The prefix cannot be a fixed string because tool specs may sit
+/// between the subcommand and the separator (`mise exec ruby@4.0.5 -- rspec`).
 ///
-/// Only the `--`-terminated `mise` forms are listed: `mise exec` accepts tool
-/// specs before the separator (`mise exec node@20 -- node x.js`), so stripping a
-/// bare `mise exec` would leave the spec at the head of the command.
-const ROUTABLE_WRAPPER_PREFIXES: &[&str] = &["uv run", "mise exec --", "mise x --"];
+/// An explicit `--` is required: without it the command boundary is ambiguous,
+/// so the whole string is left for the registry to match as `rtk mise …`.
+fn strip_mise_exec_prefix(cmd: &str) -> Option<(&str, &str)> {
+    let head = ["mise exec", "mise x"]
+        .into_iter()
+        .find(|prefix| strip_word_prefix(cmd, prefix).is_some())?;
+
+    let mut cursor = head.len();
+    loop {
+        let remainder = cmd[cursor..].trim_start();
+        if remainder.is_empty() {
+            return None;
+        }
+        let token_start = cmd.len() - remainder.len();
+        let token_end = remainder
+            .find(' ')
+            .map_or(cmd.len(), |offset| token_start + offset);
+
+        if &cmd[token_start..token_end] == "--" {
+            let inner = cmd[token_end..].trim_start();
+            if inner.is_empty() {
+                return None;
+            }
+            return Some((cmd[..token_end].trim_end(), inner));
+        }
+        if !is_mise_tool_spec(&cmd[token_start..token_end]) {
+            return None;
+        }
+        cursor = token_end;
+    }
+}
+
+/// A bare tool spec such as `ruby@4.0.5` or `node@20` — never a flag, and free of
+/// shell metacharacters that would mean we misread the command boundary.
+fn is_mise_tool_spec(token: &str) -> bool {
+    !token.starts_with('-')
+        && !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | '/'))
+}
 
 /// Shell keywords that wrap a command without changing which one runs. They are
 /// not spawnable, so they must never fall through: `rtk exec foo` cannot run.
@@ -1341,6 +1383,17 @@ fn rewrite_segment_inner(
                 return None;
             }
             break;
+        }
+    }
+
+    // `mise exec [specs] -- <cmd>`: filter the inner command while preserving the
+    // managed runtime. Falls through when the inner command has no rtk equivalent,
+    // so the registry can still match `mise …` as a whole and track the run.
+    if let Some((prefix, inner)) = strip_mise_exec_prefix(trimmed) {
+        if let Some(rewritten) =
+            rewrite_segment_inner(inner, excluded, transparent_prefixes, context, depth + 1)
+        {
+            return Some(format!("{} {}", prefix, rewritten));
         }
     }
 
@@ -5157,13 +5210,44 @@ mod tests {
     }
 
     #[test]
-    fn test_mise_exec_with_tool_spec_is_not_stripped() {
-        // `mise exec node@20 -- node x.js` has a tool spec before the separator;
-        // stripping a bare `mise exec` would leave `node@20` leading the command.
-        let rewritten = super::rewrite_command("mise exec node@20 -- git status", &[], &[]);
+    fn test_mise_exec_with_tool_spec_is_transparent() {
+        // Tool specs may sit before the separator; the spec must be preserved in
+        // the prefix and must never end up leading the rewritten command.
+        assert_eq!(
+            super::rewrite_command(
+                "mise exec ruby@4.0.5 -- bundle exec rspec spec/a.rb",
+                &[],
+                &[]
+            ),
+            Some("mise exec ruby@4.0.5 -- rtk rspec spec/a.rb".into())
+        );
+        assert_eq!(
+            super::rewrite_command("mise exec node@20 python@3.13 -- git status", &[], &[]),
+            Some("mise exec node@20 python@3.13 -- rtk git status".into())
+        );
+    }
+
+    #[test]
+    fn test_mise_exec_without_separator_is_not_split() {
+        // No `--` means no reliable command boundary: leave it to the registry
+        // rather than guessing which token starts the inner command.
+        assert_eq!(super::strip_mise_exec_prefix("mise exec ruby@4.0.5"), None);
+        assert_eq!(super::strip_mise_exec_prefix("mise exec --"), None);
+        assert_eq!(
+            super::strip_mise_exec_prefix("mise exec --env prod -- git status"),
+            None,
+            "a flag before the separator must not be read as a tool spec"
+        );
+    }
+
+    #[test]
+    fn test_mise_exec_inner_without_equivalent_falls_through() {
+        // `htop` has no rtk equivalent, so the mise layer must not claim the
+        // command — the registry still matches `mise …` as a whole.
+        let rewritten = super::rewrite_command("mise exec -- htop", &[], &[]);
         assert!(
-            !matches!(rewritten.as_deref(), Some(r) if r.starts_with("node@20")),
-            "tool spec must never lead the rewritten command: {rewritten:?}"
+            !matches!(rewritten.as_deref(), Some(r) if r.contains("-- rtk htop")),
+            "unknown inner command must not be rewritten: {rewritten:?}"
         );
     }
 
