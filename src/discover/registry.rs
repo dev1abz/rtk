@@ -1423,7 +1423,10 @@ fn rewrite_segment_inner(
     if context == RewriteContext::Normal
         && (cmd_part.starts_with("head -") || cmd_part.starts_with("tail "))
     {
-        if is_excluded(cmd_part, excluded) {
+        // Normalize first so `/usr/bin/head -3 f` matches a `head` exclusion,
+        // consistent with the classify path below.
+        let normalized = strip_absolute_path(cmd_part.trim());
+        if is_excluded(&normalized, excluded) {
             return None;
         }
         return rewrite_line_range(cmd_part).map(|r| format!("{}{}", r, redirect_suffix));
@@ -4761,6 +4764,24 @@ mod tests {
         assert_eq!(
             rewrite_command_no_prefixes("git status", &excluded),
             Some("rtk git status".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_excludes_tail_line_range_special_case() {
+        let excluded = vec!["tail".to_string()];
+        assert_eq!(
+            rewrite_command_no_prefixes("tail -n 400 /var/log/foo.log", &excluded),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_excludes_tail_line_range_with_regex() {
+        let excluded = vec!["^tail -n".to_string()];
+        assert_eq!(
+            rewrite_command_no_prefixes("tail -n 400 /var/log/foo.log", &excluded),
+            None
         );
     }
 
