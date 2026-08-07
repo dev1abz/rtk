@@ -240,11 +240,14 @@ fn build_rspec_summary(rspec: &RspecOutput) -> String {
 
         if let Some(exc) = &example.exception {
             let short_class = exc.class.split("::").last().unwrap_or(&exc.class);
-            let first_msg = exc.message.lines().next().unwrap_or("");
+            // RSpec's ExpectationNotMetError message starts with a newline, so taking
+            // only line 1 rendered an empty message and dropped the expected/got pair —
+            // the whole reason to read a failure. Keep the first few non-blank lines.
+            let first_msg = summarize_exception_message(&exc.message);
             result.push_str(&format!(
                 "   {}: {}\n",
                 short_class,
-                truncate(first_msg, 120)
+                truncate(&first_msg, 200)
             ));
 
             // First backtrace line not from gems/rspec internals
@@ -392,6 +395,22 @@ fn is_numbered_failure(line: &str) -> bool {
     }
 }
 
+/// Condense an RSpec exception message to its first few meaningful lines.
+///
+/// `ExpectationNotMetError` messages begin with a newline and put the payload on
+/// the following lines (`expected: X` / `got: Y`), so taking line 1 yields an empty
+/// string and throws away the only part worth reading. Blank lines are dropped and
+/// the remaining head is joined so the failure stays one line in the summary.
+fn summarize_exception_message(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 /// Check if a backtrace line is from gems/rspec internals.
 fn is_gem_backtrace(line: &str) -> bool {
     line.contains("/gems/")
@@ -436,6 +455,38 @@ fn compact_failure_block(block: &str) -> String {
 mod tests {
     use super::*;
     use crate::core::utils::count_tokens;
+
+    /// Real RSpec payload: the message opens with a newline, so `lines().next()`
+    /// returned "" and the summary showed a bare `ExpectationNotMetError:`.
+    const EXPECTATION_MESSAGE: &str =
+        "\nexpected: {a: 1, b: 3}\n     got: {a: 1, b: 2}\n\n(compared using ==)\n\nDiff:\n@@ -1,2 +1,2 @@\n :a => 1,\n-:b => 3,\n+:b => 2,\n";
+
+    #[test]
+    fn test_summarize_exception_message_keeps_expected_and_got() {
+        let summary = summarize_exception_message(EXPECTATION_MESSAGE);
+        assert!(
+            summary.contains("expected: {a: 1, b: 3}"),
+            "expected value must survive: {summary}"
+        );
+        assert!(
+            summary.contains("got: {a: 1, b: 2}"),
+            "actual value must survive: {summary}"
+        );
+        assert!(!summary.starts_with(' '), "leading blank must be dropped");
+    }
+
+    #[test]
+    fn test_summarize_exception_message_single_line_unchanged() {
+        assert_eq!(
+            summarize_exception_message("boom from provider adapter"),
+            "boom from provider adapter"
+        );
+    }
+
+    #[test]
+    fn test_summarize_exception_message_empty() {
+        assert_eq!(summarize_exception_message("\n\n  \n"), "");
+    }
 
     fn all_pass_json() -> &'static str {
         r#"{
