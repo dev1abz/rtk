@@ -1170,7 +1170,11 @@ fn rewrite_line_range(cmd: &str) -> Option<String> {
 
 /// Transparent wrappers that RULES can also match as a whole string, so an
 /// unfiltered inner command falls through instead of dropping the rewrite.
-const ROUTABLE_WRAPPER_PREFIXES: &[&str] = &["uv run"];
+///
+/// Only the `--`-terminated `mise` forms are listed: `mise exec` accepts tool
+/// specs before the separator (`mise exec node@20 -- node x.js`), so stripping a
+/// bare `mise exec` would leave the spec at the head of the command.
+const ROUTABLE_WRAPPER_PREFIXES: &[&str] = &["uv run", "mise exec --", "mise x --"];
 
 /// Shell keywords that wrap a command without changing which one runs. They are
 /// not spawnable, so they must never fall through: `rtk exec foo` cannot run.
@@ -5133,6 +5137,35 @@ mod tests {
     }
 
     // --- transparent_prefixes tests ---
+
+    #[test]
+    fn test_mise_exec_is_builtin_transparent() {
+        // mise is the default runtime manager in several Ruby/Python shops, so
+        // `mise exec -- <cmd>` must route without per-user config.
+        assert_eq!(
+            super::rewrite_command("mise exec -- bundle exec rspec spec/a_spec.rb", &[], &[]),
+            Some("mise exec -- rtk rspec spec/a_spec.rb".into())
+        );
+        assert_eq!(
+            super::rewrite_command("mise exec -- git status", &[], &[]),
+            Some("mise exec -- rtk git status".into())
+        );
+        assert_eq!(
+            super::rewrite_command("mise x -- git status", &[], &[]),
+            Some("mise x -- rtk git status".into())
+        );
+    }
+
+    #[test]
+    fn test_mise_exec_with_tool_spec_is_not_stripped() {
+        // `mise exec node@20 -- node x.js` has a tool spec before the separator;
+        // stripping a bare `mise exec` would leave `node@20` leading the command.
+        let rewritten = super::rewrite_command("mise exec node@20 -- git status", &[], &[]);
+        assert!(
+            !matches!(rewritten.as_deref(), Some(r) if r.starts_with("node@20")),
+            "tool spec must never lead the rewritten command: {rewritten:?}"
+        );
+    }
 
     #[test]
     fn test_transparent_prefix_strips_and_reprepends() {
