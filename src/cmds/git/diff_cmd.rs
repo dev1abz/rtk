@@ -17,24 +17,66 @@ pub fn run(file1: &Path, file2: &Path, verbose: u8) -> Result<i32> {
 
     let content1 = fs::read_to_string(file1)?;
     let content2 = fs::read_to_string(file2)?;
+    // Display fallback only: if the condensed form would be larger, show both
+    // files rather than something bigger than the input. This is NOT the savings
+    // baseline — see `FileComparison::baseline`.
     let raw = format!("{}\n---\n{}", content1, content2);
 
-    let (rtk, exit_code) = render_file_diff(file1, file2, &content1, &content2);
+    let comparison = render_file_diff(file1, file2, &content1, &content2);
 
-    let shown = never_worse(&raw, &rtk);
+    let shown = never_worse(&raw, &comparison.rendered);
     print!("{}", shown);
     timer.track(
         &format!("diff {} {}", file1.display(), file2.display()),
         "rtk diff",
-        &raw,
+        &comparison.baseline,
         shown,
     );
-    Ok(exit_code)
+    Ok(comparison.exit_code)
+}
+
+/// A rendered comparison plus the baseline used for savings accounting.
+struct FileComparison {
+    /// Condensed body rtk wants to show.
+    rendered: String,
+    /// diff convention: 0 identical, 1 differing.
+    exit_code: i32,
+    /// What `diff(1)` would have printed. Savings are measured against this.
+    baseline: String,
+}
+
+/// Bytes `diff(1)` would have emitted, in its normal output format.
+///
+/// Savings were previously measured against both files concatenated, which is
+/// output no command produces. For identical files `diff` prints nothing, yet
+/// the whole file size was booked as saved — a 51 KB pair recorded 100% savings
+/// on output that was 25 bytes *larger* than native. `rtk diff` was the single
+/// largest reported saver while being a net loss.
+///
+/// Where the true baseline is uncertain the estimate is deliberately low: a
+/// savings metric that overstates is worse than one that understates.
+fn native_diff_baseline(diff: &DiffResult) -> String {
+    let mut out = String::new();
+    for change in &diff.changes {
+        match change {
+            DiffChange::Added(ln, c) => out.push_str(&format!("{0}a{0}\n> {1}\n", ln, c)),
+            DiffChange::Removed(ln, c) => out.push_str(&format!("{0}d{0}\n< {1}\n", ln, c)),
+            DiffChange::Modified(ln, old, new) => {
+                out.push_str(&format!("{0}c{0}\n< {1}\n---\n> {2}\n", ln, old, new))
+            }
+        }
+    }
+    out
 }
 
 /// Renders the condensed file comparison and returns it with the
 /// diff-convention exit code (0 = identical, 1 = differences found).
-fn render_file_diff(file1: &Path, file2: &Path, content1: &str, content2: &str) -> (String, i32) {
+fn render_file_diff(
+    file1: &Path,
+    file2: &Path,
+    content1: &str,
+    content2: &str,
+) -> FileComparison {
     // Byte equality is the only safe basis for claiming identity, and it must be
     // checked before `lines()` touches the input. `str::lines()` strips a
     // trailing `\r` and treats the final newline as optional, so a CRLF-vs-LF or
@@ -42,7 +84,12 @@ fn render_file_diff(file1: &Path, file2: &Path, content1: &str, content2: &str) 
     // Reporting "identical" with exit 0 for files that differ silently passes
     // any verification gate built on `diff`.
     if content1 == content2 {
-        return ("[ok] Files are identical\n".to_string(), 0);
+        // `diff` prints nothing for identical files, so there is nothing to save.
+        return FileComparison {
+            rendered: "[ok] Files are identical\n".to_string(),
+            exit_code: 0,
+            baseline: String::new(),
+        };
     }
 
     let lines1: Vec<&str> = content1.lines().collect();
@@ -52,10 +99,13 @@ fn render_file_diff(file1: &Path, file2: &Path, content1: &str, content2: &str) 
     if diff.changes.is_empty() {
         // Bytes differ, lines don't: the difference is exactly what `lines()`
         // normalizes away. Name it rather than rendering an empty change list.
-        return (
-            describe_invisible_difference(file1, file2, content1, content2),
-            1,
-        );
+        // `diff` emits only a couple of marker lines here, so claim no saving
+        // rather than guess at a baseline.
+        return FileComparison {
+            rendered: describe_invisible_difference(file1, file2, content1, content2),
+            exit_code: 1,
+            baseline: String::new(),
+        };
     }
 
     let mut rtk = String::new();
@@ -65,7 +115,12 @@ fn render_file_diff(file1: &Path, file2: &Path, content1: &str, content2: &str) 
         diff.added, diff.removed, diff.modified
     ));
     rtk.push_str(&format_diff_changes(&diff));
-    (rtk, 1)
+
+    FileComparison {
+        baseline: native_diff_baseline(&diff),
+        rendered: rtk,
+        exit_code: 1,
+    }
 }
 
 /// Describe a difference that a line-based diff cannot see.
@@ -413,6 +468,13 @@ fn condense_unified_diff(diff: &str) -> String {
 mod tests {
     use super::*;
 
+    /// These tests assert on the rendered body and exit code; the savings
+    /// baseline is covered by its own tests below.
+    fn render_pair(f1: &Path, f2: &Path, c1: &str, c2: &str) -> (String, i32) {
+        let c = render_file_diff(f1, f2, c1, c2);
+        (c.rendered, c.exit_code)
+    }
+
     // --- similarity ---
 
     #[test]
@@ -578,13 +640,98 @@ mod tests {
         assert_eq!(result.removed, 1);
     }
 
+    // --- savings baseline ---
+
+    /// Identical files: `diff` prints nothing, so nothing can be saved.
+    ///
+    /// The baseline used to be both files concatenated, so every identical-file
+    /// comparison booked the whole file size as saved while rtk actually printed
+    /// 25 bytes more than native — `rtk diff` was the largest reported saver in
+    /// a 3.5k-command history while being a net loss.
+    #[test]
+    fn test_baseline_is_empty_for_identical_files() {
+        let content = "alpha\nbeta\ngamma\n".repeat(400);
+        let c = render_file_diff(
+            Path::new("a.txt"),
+            Path::new("b.txt"),
+            &content,
+            &content,
+        );
+        assert_eq!(c.exit_code, 0);
+        assert!(
+            c.baseline.is_empty(),
+            "identical files must claim no saving, got {} bytes",
+            c.baseline.len()
+        );
+    }
+
+    /// Bytes-differ-but-lines-match (CRLF, missing final newline): `diff` emits
+    /// only a couple of marker lines, so claim nothing rather than guess.
+    #[test]
+    fn test_baseline_is_empty_for_invisible_difference() {
+        let c = render_file_diff(
+            Path::new("a.txt"),
+            Path::new("b.txt"),
+            "alpha\nbeta\n",
+            "alpha\nbeta",
+        );
+        assert_eq!(c.exit_code, 1);
+        assert!(c.baseline.is_empty());
+    }
+
+    /// For real changes the baseline models `diff(1)` normal format — the changed
+    /// lines only, never the untouched bulk of either file.
+    #[test]
+    fn test_baseline_covers_changes_not_whole_files() {
+        let filler = "unchanged line\n".repeat(500);
+        let c1 = format!("{filler}old value\n");
+        let c2 = format!("{filler}new value\n");
+
+        let c = render_file_diff(Path::new("a.txt"), Path::new("b.txt"), &c1, &c2);
+        assert_eq!(c.exit_code, 1);
+        assert!(
+            c.baseline.contains("old value") && c.baseline.contains("new value"),
+            "baseline must include both sides of the change: {}",
+            c.baseline
+        );
+        assert!(
+            !c.baseline.contains("unchanged line"),
+            "baseline must exclude untouched content"
+        );
+        let both_files = c1.len() + c2.len();
+        assert!(
+            c.baseline.len() * 20 < both_files,
+            "baseline {} must be far below both files concatenated {}",
+            c.baseline.len(),
+            both_files
+        );
+    }
+
+    #[test]
+    fn test_baseline_renders_diff_normal_format() {
+        let diff = DiffResult {
+            added: 1,
+            removed: 1,
+            modified: 1,
+            changes: vec![
+                DiffChange::Added(3, "added".into()),
+                DiffChange::Removed(7, "removed".into()),
+                DiffChange::Modified(9, "before".into(), "after".into()),
+            ],
+        };
+        assert_eq!(
+            native_diff_baseline(&diff),
+            "3a3\n> added\n7d7\n< removed\n9c9\n< before\n---\n> after\n"
+        );
+    }
+
     // --- render_file_diff (issue #2364 regression) ---
 
     #[test]
     fn test_render_modified_only_yaml_not_identical() {
         // "a: 1" vs "a: 2" is classified as modified (similarity > 0.5);
         // the identical check must not ignore modified-only diffs.
-        let (out, code) = render_file_diff(
+        let (out, code) = render_pair(
             Path::new("one.yaml"),
             Path::new("two.yaml"),
             "a: 1\n",
@@ -606,7 +753,7 @@ mod tests {
         // `str::lines()` strips a trailing `\r`, so a CRLF-vs-LF file pair used
         // to collapse to identical line vectors and report "[ok] Files are
         // identical" with exit 0. `cmp` says these differ at byte 6.
-        let (out, code) = render_file_diff(
+        let (out, code) = render_pair(
             Path::new("a.txt"),
             Path::new("b.txt"),
             "keep1\nkeep2\nkeep3\n",
@@ -624,7 +771,7 @@ mod tests {
     #[test]
     fn test_render_trailing_newline_difference_is_not_identical() {
         // The other thing `lines()` normalizes: the final newline is optional.
-        let (out, code) = render_file_diff(
+        let (out, code) = render_pair(
             Path::new("a.txt"),
             Path::new("b.txt"),
             "keep1\nkeep2\n",
@@ -642,7 +789,7 @@ mod tests {
     #[test]
     fn test_render_byte_identical_is_identical() {
         // The guard must not flip the true-identity case to a false positive.
-        let (out, code) = render_file_diff(
+        let (out, code) = render_pair(
             Path::new("a.txt"),
             Path::new("b.txt"),
             "keep1\nkeep2\n",
@@ -668,7 +815,7 @@ mod tests {
             .collect();
         assert_ne!(plain, mixed, "fixture must actually differ");
 
-        let (out, code) = render_file_diff(Path::new("a.txt"), Path::new("b.txt"), &plain, &mixed);
+        let (out, code) = render_pair(Path::new("a.txt"), Path::new("b.txt"), &plain, &mixed);
         assert!(!out.contains("identical"), "got: {}", out);
         assert_eq!(code, 1, "must exit 1 so a `diff` gate fails");
         assert!(out.contains("0 CRLF vs 24 CRLF"), "got: {}", out);
@@ -676,7 +823,7 @@ mod tests {
 
     #[test]
     fn test_render_modified_only_json_not_identical() {
-        let (out, code) = render_file_diff(
+        let (out, code) = render_pair(
             Path::new("j1.json"),
             Path::new("j2.json"),
             "{\"a\": 1}\n",
@@ -692,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_render_identical_files_exit_zero() {
-        let (out, code) = render_file_diff(
+        let (out, code) = render_pair(
             Path::new("a.yaml"),
             Path::new("b.yaml"),
             "a: 1\nb: 2\n",
@@ -704,7 +851,7 @@ mod tests {
 
     #[test]
     fn test_render_added_removed_exit_one() {
-        let (out, code) = render_file_diff(Path::new("t1.txt"), Path::new("t2.txt"), "x\n", "y\n");
+        let (out, code) = render_pair(Path::new("t1.txt"), Path::new("t2.txt"), "x\n", "y\n");
         assert!(out.contains("+1 added, -1 removed"));
         assert_eq!(code, 1);
     }
