@@ -97,7 +97,7 @@ pub fn run(file1: &Path, file2: &Path, verbose: u8) -> Result<i32> {
     timer.track(
         &command,
         "rtk diff",
-        tracking_baseline(&fallback, &both_files, shown),
+        tracking_baseline(&comparison, &fallback, &both_files, shown),
         shown,
     );
     Ok(exit_code)
@@ -165,9 +165,25 @@ fn classic_fallback(comparison: &FileComparison) -> String {
 /// Baseline the savings are measured against: what `diff` itself would have
 /// printed, so the recorded ratio compares like with like and can never go
 /// negative -- the guard already caps the shown output at the fallback.
-fn tracking_baseline<'a>(fallback: &'a str, both_files: &'a str, shown: &'a str) -> &'a str {
+fn tracking_baseline<'a>(
+    comparison: &FileComparison,
+    fallback: &'a str,
+    both_files: &'a str,
+    shown: &'a str,
+) -> &'a str {
     if !fallback.is_empty() {
         return fallback;
+    }
+
+    // `diff` prints nothing for identical files and a marker line or two for a
+    // difference `lines()` cannot see, so neither saved anything. Measuring them
+    // against the dump booked the whole file pair as savings on every
+    // `diff a b > /dev/null` check.
+    if matches!(
+        comparison,
+        FileComparison::Identical | FileComparison::InvisibleDifference(_)
+    ) {
+        return shown;
     }
 
     // No classic diff to measure against, so the dump of both files stands in
@@ -4257,7 +4273,7 @@ mod tests {
         let fallback = classic_fallback(&comparison);
         let (rendered, _) = render_diff(Path::new("a"), Path::new("b"), &comparison);
         let shown = select_file_diff_output(&comparison, &fallback, &both_files, &rendered);
-        let baseline = tracking_baseline(&fallback, &both_files, shown);
+        let baseline = tracking_baseline(&comparison, &fallback, &both_files, shown);
 
         assert!(
             tracking::estimate_tokens(baseline) >= tracking::estimate_tokens(shown),
@@ -4268,14 +4284,26 @@ mod tests {
     }
 
     #[test]
-    fn test_tracking_baseline_identical_files_use_both_files() {
+    fn test_tracking_baseline_identical_files_claim_nothing() {
         let both_files = "a: 1\nb: 2\n\n---\na: 1\nb: 2\n";
         let shown = "[ok] Files are identical\n";
 
         assert_eq!(
-            tracking_baseline("", both_files, shown),
-            both_files,
-            "identical files should still measure against the dump"
+            tracking_baseline(&FileComparison::Identical, "", both_files, shown),
+            shown,
+            "diff prints nothing for identical files, so there is nothing to have saved"
+        );
+    }
+
+    #[test]
+    fn test_tracking_baseline_invisible_difference_claims_nothing() {
+        let comparison = compare_files("a\r\n", "a\n");
+        let shown = "files differ only in line endings\n";
+
+        assert!(matches!(comparison, FileComparison::InvisibleDifference(_)));
+        assert_eq!(
+            tracking_baseline(&comparison, "", "a\r\n\n---\na\n", shown),
+            shown
         );
     }
 
@@ -4284,7 +4312,10 @@ mod tests {
         // Both files empty: the dump is shorter than the verdict line.
         let shown = "[ok] Files are identical\n";
 
-        assert_eq!(tracking_baseline("", "\n---\n", shown), shown);
+        assert_eq!(
+            tracking_baseline(&FileComparison::Identical, "", "\n---\n", shown),
+            shown
+        );
     }
 
     #[test]
