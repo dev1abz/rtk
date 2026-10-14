@@ -241,11 +241,14 @@ fn build_rspec_summary(rspec: &RspecOutput) -> String {
 
         if let Some(exc) = &example.exception {
             let short_class = exc.class.split("::").last().unwrap_or(&exc.class);
-            let first_msg = exc.message.lines().next().unwrap_or("");
+            // RSpec's ExpectationNotMetError message starts with a newline, so taking
+            // only line 1 rendered an empty message and dropped the expected/got pair —
+            // the whole reason to read a failure. Keep the first few non-blank lines.
+            let first_msg = summarize_exception_message(&exc.message);
             result.push_str(&format!(
                 "   {}: {}\n",
                 short_class,
-                truncate(first_msg, 120)
+                truncate(&first_msg, 200)
             ));
 
             // First backtrace line not from gems/rspec internals
@@ -393,6 +396,22 @@ fn is_numbered_failure(line: &str) -> bool {
     }
 }
 
+/// Condense an RSpec exception message to its first few meaningful lines.
+///
+/// `ExpectationNotMetError` messages begin with a newline and put the payload on
+/// the following lines (`expected: X` / `got: Y`), so taking line 1 yields an empty
+/// string and throws away the only part worth reading. Blank lines are dropped and
+/// the remaining head is joined so the failure stays one line in the summary.
+fn summarize_exception_message(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 /// Check if a backtrace line is from gems/rspec internals.
 fn is_gem_backtrace(line: &str) -> bool {
     line.contains("/gems/")
@@ -437,6 +456,37 @@ fn compact_failure_block(block: &str) -> String {
 mod tests {
     use super::*;
     use crate::core::utils::count_tokens;
+
+    /// Real RSpec payload: the message opens with a newline, so `lines().next()`
+    /// returned "" and the summary showed a bare `ExpectationNotMetError:`.
+    const EXPECTATION_MESSAGE: &str = "\nexpected: {a: 1, b: 3}\n     got: {a: 1, b: 2}\n\n(compared using ==)\n\nDiff:\n@@ -1,2 +1,2 @@\n :a => 1,\n-:b => 3,\n+:b => 2,\n";
+
+    #[test]
+    fn test_summarize_exception_message_keeps_expected_and_got() {
+        let summary = summarize_exception_message(EXPECTATION_MESSAGE);
+        assert!(
+            summary.contains("expected: {a: 1, b: 3}"),
+            "expected value must survive: {summary}"
+        );
+        assert!(
+            summary.contains("got: {a: 1, b: 2}"),
+            "actual value must survive: {summary}"
+        );
+        assert!(!summary.starts_with(' '), "leading blank must be dropped");
+    }
+
+    #[test]
+    fn test_summarize_exception_message_single_line_unchanged() {
+        assert_eq!(
+            summarize_exception_message("boom from provider adapter"),
+            "boom from provider adapter"
+        );
+    }
+
+    #[test]
+    fn test_summarize_exception_message_empty() {
+        assert_eq!(summarize_exception_message("\n\n  \n"), "");
+    }
 
     fn all_pass_json() -> &'static str {
         r#"{
@@ -601,6 +651,60 @@ mod tests {
         assert!(result.contains("user_spec.rb:10"));
         assert!(result.contains("ExpectationNotMetError"));
         assert!(result.contains("expected true but got false"));
+    }
+
+    /// End-to-end guard for the empty-message regression.
+    ///
+    /// `with_failures_json()` carries a single-line message, so it passes even
+    /// when only the first line is kept. Real RSpec opens an
+    /// `ExpectationNotMetError` message with a newline, which is the shape that
+    /// actually broke: the summary rendered `ExpectationNotMetError:` and no
+    /// expected/got. This fixture reproduces that and fails on a call-site
+    /// regression, not just a change to the helper.
+    #[test]
+    fn test_filter_rspec_keeps_expected_and_got_from_leading_newline_message() {
+        let json = r#"{
+          "version": "3.13.6",
+          "examples": [
+            {
+              "id": "./spec/probe_spec.rb[1:1]",
+              "description": "matches the expected payload",
+              "full_description": "Probe matches the expected payload",
+              "status": "failed",
+              "file_path": "./spec/probe_spec.rb",
+              "line_number": 6,
+              "run_time": 0.005,
+              "pending_message": null,
+              "exception": {
+                "class": "RSpec::Expectations::ExpectationNotMetError",
+                "message": "\nexpected: {a: 1, b: 3}\n     got: {a: 1, b: 2}\n\n(compared using ==)\n",
+                "backtrace": ["./spec/probe_spec.rb:7:in 'block (2 levels) in <top (required)>'"]
+              }
+            }
+          ],
+          "summary": {
+            "duration": 0.006,
+            "example_count": 1,
+            "failure_count": 1,
+            "pending_count": 0,
+            "errors_outside_of_examples_count": 0
+          },
+          "summary_line": "1 example, 1 failure"
+        }"#;
+
+        let result = filter_rspec_output(json);
+        assert!(
+            result.contains("expected: {a: 1, b: 3}"),
+            "expected value must reach the summary: {result}"
+        );
+        assert!(
+            result.contains("got: {a: 1, b: 2}"),
+            "actual value must reach the summary: {result}"
+        );
+        assert!(
+            !result.contains("ExpectationNotMetError: \n"),
+            "class must never be followed by an empty message: {result}"
+        );
     }
 
     #[test]
